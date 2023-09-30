@@ -2,8 +2,9 @@ package dedupe
 
 import dedupe.DeduplicationEvent._
 
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 import scala.collection.mutable
+import scala.collection.mutable.ListBuffer
 import scala.util.hashing.MurmurHash3
 
 class RecursiveChungusDedupe[T](
@@ -11,25 +12,28 @@ class RecursiveChungusDedupe[T](
   maxChunkBytes: Long,
   chunkStoreFactory: Int => ChunkStore[T],
   deduplicationEventListener: DeduplicationEventListener,
+  collisionTableEstimator: CollisionTableEstimator = new BrainThinkingCollisionTableEstimator,
   private val recursionLevel: Int = 0,
   private val chunkStoreCounter: AtomicInteger = new AtomicInteger()
-)(implicit hasher: DedupeHash[T], comparator: DedupeEquals[T], mixer: DedupeMerge[T]) extends Iterable[T] {
+)(implicit hasher: DedupeHash[T], comparator: DedupeEquals[T], mixer: DedupeMerge[T]) extends Iterable[T] with AutoCloseable {
 
   require(datasetByteSize > 0, "datasetByteSize must be positive")
 
-  private val collisionTableSize = {
-    def log2(n: Long) = Math.log(n) / Math.log(2.0)
-    val baseEstimate = log2(datasetByteSize).toInt
-    // smallest higher power of 2
-    1 << (32 - Integer.numberOfLeadingZeros(baseEstimate - 1))
-  }
+  private val collisionTableSize = collisionTableEstimator.estimateColisionTableSize(datasetByteSize, maxChunkBytes)
   deduplicationEventListener.onDeduplicationEvent(DeduplicationStarted(collisionTableSize, recursionLevel))
+
+  private val allocatedChunkStores = ListBuffer.empty[ChunkStore[T]]
+  private val topLevelCollectionChunkStoreFactory = if (recursionLevel > 0) chunkStoreFactory else { index: Int =>
+    val store = chunkStoreFactory(index)
+    allocatedChunkStores += store
+    store
+  }
 
   private val chunks = Array.ofDim[ChunkStore[T]](collisionTableSize)
   private def safeStore(index: Int): ChunkStore[T] = {
     val store = chunks(index)
     if (store == null) {
-      val newStore = chunkStoreFactory(chunkStoreCounter.getAndIncrement())
+      val newStore = topLevelCollectionChunkStoreFactory(chunkStoreCounter.getAndIncrement())
       deduplicationEventListener.onDeduplicationEvent(ChunkStoreCreated(index, chunks.size, recursionLevel))
       chunks(index) = newStore
       newStore
@@ -90,7 +94,15 @@ class RecursiveChungusDedupe[T](
         else {
           val it = if (chunk.memoryImprintBytes > maxChunkBytes) {
             deduplicationEventListener.onDeduplicationEvent(SplittingChunkTooBig(chunk.memoryImprintBytes, maxChunkBytes, chunkIndex, chunks.size))
-            val subchungus = new RecursiveChungusDedupe[T](chunk.memoryImprintBytes, maxChunkBytes, chunkStoreFactory, deduplicationEventListener, recursionLevel + 1, chunkStoreCounter)
+            val subchungus = new RecursiveChungusDedupe[T](
+              chunk.memoryImprintBytes,
+              maxChunkBytes,
+              topLevelCollectionChunkStoreFactory,
+              deduplicationEventListener,
+              collisionTableEstimator,
+              recursionLevel + 1,
+              chunkStoreCounter
+            )
             chunk foreach subchungus.add
             subchungus.iterator
           } else {
@@ -104,6 +116,18 @@ class RecursiveChungusDedupe[T](
           new DepletionAwareIterator(deleteChunk)(it)
         }
       }
+  }
+
+  override def close(): Unit = {
+    val firstError = new AtomicReference[Throwable]()
+    allocatedChunkStores foreach { store =>
+      try {
+        store.free()
+      } catch {
+        case t: Throwable => firstError.compareAndSet(null, t)
+      }
+    }
+    Option(firstError.get) foreach (t => throw t)
   }
 
 }
