@@ -17,6 +17,8 @@ class RecursiveChungusDedupe[T](
   private val chunkStoreCounter: AtomicInteger = new AtomicInteger()
 )(implicit hasher: DedupeHash[T], comparator: DedupeEquals[T], mixer: DedupeMerge[T]) extends Iterable[T] with AutoCloseable {
 
+  assert(recursionLevel < 16)
+
   require(datasetByteSize > 0, "datasetByteSize must be positive")
 
   private val collisionTableSize = collisionTableEstimator.estimateColisionTableSize(datasetByteSize, maxChunkBytes)
@@ -85,7 +87,7 @@ class RecursiveChungusDedupe[T](
     override def next(): T = iterator.next
   }
 
-  override def iterator: Iterator[T] = {
+  override def iterator: Iterator[T] = new DepletionAwareIterator(() => deduplicationEventListener.onDeduplicationEvent(DeduplicationFinished(recursionLevel)))(
     chunks
       .iterator
       .zipWithIndex
@@ -93,7 +95,7 @@ class RecursiveChungusDedupe[T](
         if (chunk == null) Iterator.empty
         else {
           val it = if (chunk.memoryImprintBytes > maxChunkBytes) {
-            deduplicationEventListener.onDeduplicationEvent(SplittingChunkTooBig(chunk.memoryImprintBytes, maxChunkBytes, chunkIndex, chunks.size))
+            deduplicationEventListener.onDeduplicationEvent(SplittingChunkTooBig(chunk.memoryImprintBytes, maxChunkBytes, chunkIndex, chunks.size, recursionLevel))
             val subchungus = new RecursiveChungusDedupe[T](
               chunk.memoryImprintBytes,
               maxChunkBytes,
@@ -116,7 +118,7 @@ class RecursiveChungusDedupe[T](
           new DepletionAwareIterator(deleteChunk)(it)
         }
       }
-  }
+  )
 
   override def close(): Unit = {
     val firstError = new AtomicReference[Throwable]()
